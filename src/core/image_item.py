@@ -19,7 +19,9 @@ class ImageItem:
         self.start_duration = 1.0  # seconds
         self.end_transition = "Fade Out"
         self.end_duration = 1.0  # seconds
-        self.effect = "None"
+        self.effect = "Zoom In"
+        self.overlay_effect = "None"  # New property for overlay effects
+        self.overlay_text = ""  # Default text for overlay effects
     
     def get_filename(self):
         """Get the filename without path"""

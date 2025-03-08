@@ -7,14 +7,98 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QListWidget, QComboBox, 
     QSpinBox, QDoubleSpinBox, QFileDialog, QMessageBox,
     QTabWidget, QGroupBox, QFormLayout, QScrollArea,
-    QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup
+    QListWidgetItem, QCheckBox, QRadioButton, QButtonGroup,
+    QProgressBar, QDialog, QApplication
 )
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QObject, QEvent
 from PyQt6.QtGui import QIcon, QPixmap
 import random
+import threading
+import os
 
 from src.core.image_item import ImageItem
 from src.core.video_generator import VideoGenerator
+
+
+class ProgressWorker(QObject):
+    """Worker object that emits signals for progress updates"""
+    progress_updated = pyqtSignal(int, str)
+    generation_finished = pyqtSignal(bool, str)  # Success status and output path
+    
+    def __init__(self, video_generator, image_items, output_path, aspect_ratio, frame_rate, transition_overlap, quality):
+        super().__init__()
+        self.video_generator = video_generator
+        self.image_items = image_items
+        self.output_path = output_path
+        self.aspect_ratio = aspect_ratio
+        self.frame_rate = frame_rate
+        self.transition_overlap = transition_overlap
+        self.quality = quality
+        self.success = False
+        
+    def run(self):
+        """Run the video generation process"""
+        try:
+            # Set up progress callback
+            def progress_callback(value, message):
+                self.progress_updated.emit(value, message)
+            
+            # Set the progress callback on the video generator
+            self.video_generator.set_progress_callback(progress_callback)
+            
+            # Generate the video
+            self.success = self.video_generator.generate_video(
+                self.image_items,
+                self.output_path,
+                self.aspect_ratio,
+                self.frame_rate,
+                self.transition_overlap,
+                self.quality
+            )
+            
+            # Emit the finished signal with success status and output path
+            self.generation_finished.emit(self.success, self.output_path)
+            
+        except Exception as e:
+            print(f"Error in worker thread: {str(e)}")
+            self.success = False
+            self.generation_finished.emit(False, self.output_path)
+
+
+class ProgressDialog(QDialog):
+    """Dialog to show progress during video generation"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Generating Video")
+        self.setMinimumWidth(500)
+        self.setModal(True)
+        
+        # Create layout
+        layout = QVBoxLayout(self)
+        
+        # Add status label
+        self.status_label = QLabel("Initializing...")
+        layout.addWidget(self.status_label)
+        
+        # Add progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+        
+        # Add cancel button
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.cancel_button)
+        
+    def update_progress(self, value, message):
+        """Update the progress bar and status label"""
+        self.progress_bar.setValue(value)
+        self.status_label.setText(message)
+        
+        # Process events to update the UI
+        QApplication.processEvents()
 
 
 class MainWindow(QMainWindow):
@@ -661,12 +745,12 @@ class MainWindow(QMainWindow):
         quality = self.output_quality.currentText()
         
         try:
-            # Show progress message
-            QMessageBox.information(self, "Processing", 
-                                   "Video generation has started. This may take a while depending on the number of images and effects.")
+            # Create progress dialog
+            progress_dialog = ProgressDialog(self)
             
-            # Generate the video
-            self.video_generator.generate_video(
+            # Create worker object
+            worker = ProgressWorker(
+                self.video_generator,
                 self.image_items,
                 output_path,
                 aspect_ratio,
@@ -675,9 +759,49 @@ class MainWindow(QMainWindow):
                 quality
             )
             
-            # Show success message
-            QMessageBox.information(self, "Success", f"Video successfully generated and saved to:\n{output_path}")
+            # Connect worker signals to dialog slots
+            worker.progress_updated.connect(progress_dialog.update_progress)
+            
+            # Connect the finished signal to handle completion
+            def on_generation_finished(success, output_path):
+                # Close the dialog if it's still open
+                if progress_dialog.isVisible():
+                    progress_dialog.accept()
+                    
+                # Show result message
+                if success:
+                    QMessageBox.information(self, "Success", 
+                                          f"Video successfully generated and saved to:\n{output_path}")
+                else:
+                    # Check if the file exists anyway
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                        QMessageBox.warning(self, "Warning", 
+                                         f"Video was generated with some errors but appears to be usable.\n"
+                                         f"Saved to: {output_path}\n"
+                                         f"Check the logs for details.")
+                    else:
+                        QMessageBox.critical(self, "Error", 
+                                          "An error occurred during video generation. Check the logs for details.")
+            
+            worker.generation_finished.connect(on_generation_finished)
+            
+            # Create and start thread
+            def thread_function():
+                worker.run()
+            
+            thread = threading.Thread(target=thread_function)
+            thread.daemon = True
+            thread.start()
+            
+            # Show the dialog (this will block until the dialog is closed)
+            result = progress_dialog.exec()
+            
+            # If the user cancelled, we can't really stop the thread,
+            # but we can show a message
+            if result == QDialog.DialogCode.Rejected:
+                QMessageBox.information(self, "Cancelled", 
+                                      "Video generation is still running in the background.\n"
+                                      "You can continue using the application.")
             
         except Exception as e:
-            # Show error message
-            QMessageBox.critical(self, "Error", f"An error occurred while generating the video:\n{str(e)}") 
+            QMessageBox.critical(self, "Error", f"An error occurred: {str(e)}") 

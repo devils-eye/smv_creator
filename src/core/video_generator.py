@@ -13,6 +13,9 @@ from moviepy.editor import (
 from PIL import Image, ImageDraw, ImageFilter, ImageEnhance, ImageOps, ImageFont
 import random
 import math
+import logging
+import time
+import threading
 
 # Set the default font
 DEFAULT_FONT = 'DejaVuSans'
@@ -23,6 +26,28 @@ class VideoGenerator:
     
     def __init__(self):
         """Initialize the video generator"""
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        
+        # Create a file handler
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+        file_handler = logging.FileHandler('logs/video_generator.log')
+        file_handler.setLevel(logging.INFO)
+        
+        # Create a console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # Create a formatter and add it to the handlers
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        # Add the handlers to the logger
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        
         # Quality presets (bitrate in kbps)
         self.quality_presets = {
             "Low": 1000,
@@ -40,11 +65,37 @@ class VideoGenerator:
         
         # Debug mode
         self.debug = True
+        
+        # Progress callback
+        self.progress_callback = None
+        self.total_steps = 0
+        self.current_step = 0
     
     def log(self, message):
-        """Print debug message if debug mode is enabled"""
-        if self.debug:
-            print(f"[DEBUG] {message}")
+        """Log a message"""
+        self.logger.info(message)
+        print(message)  # Also print to console for immediate feedback
+    
+    def set_progress_callback(self, callback):
+        """Set a callback function for progress updates"""
+        self.progress_callback = callback
+        
+    def update_progress(self, message, step=None):
+        """Update the progress"""
+        if step is not None:
+            self.current_step = step
+        else:
+            self.current_step += 1
+            
+        progress = int((self.current_step / self.total_steps) * 100) if self.total_steps > 0 else 0
+        
+        # Log progress to console
+        progress_bar = '|' + '█' * (progress // 2) + ' ' * (50 - (progress // 2)) + '|'
+        print(f"\r{progress_bar} {progress}% - {message}", end='', flush=True)
+        
+        # Call the callback if it exists
+        if self.progress_callback:
+            self.progress_callback(progress, message)
     
     def generate_video(self, image_items, output_path, aspect_ratio="16:9", 
                       frame_rate=30, transition_overlap=0.5, quality="High"):
@@ -53,7 +104,13 @@ class VideoGenerator:
             raise ValueError("No images provided")
         
         self.log(f"Starting video generation with {len(image_items)} images")
+        self.log(f"Output path: {output_path}")
         self.log(f"Aspect ratio: {aspect_ratio}, Frame rate: {frame_rate}, Quality: {quality}")
+        
+        # Calculate total steps for progress tracking - include writing process
+        self.total_steps = len(image_items) * 2 + 10  # Loading + processing each image + concatenation + writing (which is weighted more)
+        self.current_step = 0
+        self.update_progress("Initializing video generation", 0)
         
         # Get dimensions based on aspect ratio
         width, height = self.aspect_ratios.get(aspect_ratio, (1920, 1080))
@@ -67,16 +124,16 @@ class VideoGenerator:
         
         try:
             for i, item in enumerate(image_items):
-                self.log(f"Processing image {i+1}/{len(image_items)}: {item.filepath}")
+                self.update_progress(f"Processing image {i+1}/{len(image_items)}: {item.filepath}")
                 
                 # Create the base image clip
                 try:
                     clip = self._create_image_clip(item, width, height)
-                    self.log(f"  - Created clip with size: {clip.size}, duration: {clip.duration}s")
+                    self.update_progress(f"Completed processing image {i+1}/{len(image_items)}")
                     
                     # Store clip information for debugging
                     if hasattr(clip, 'size'):
-                        self.log(f"  - Clip size: {clip.size}")
+                        self.log(f"  - Created clip with size: {clip.size}, duration: {clip.duration}s")
                     else:
                         self.log(f"  - Warning: Clip has no size attribute")
                     
@@ -84,6 +141,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"  - ERROR creating clip: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error processing image {i+1}: {str(e)}", self.total_steps)
                     raise Exception(f"Error processing image {i+1}: {str(e)}")
             
             self.log(f"All clips created, concatenating {len(clips)} clips")
@@ -93,10 +151,12 @@ class VideoGenerator:
                 self.log(f"Clip {i+1} info: size={clip.size}, duration={clip.duration}s")
             
             # Concatenate all clips
+            self.update_progress("Concatenating clips", len(image_items) * 2 + 1)
             try:
                 self.log("Attempting to concatenate clips...")
                 final_clip = concatenate_videoclips(clips, method="compose", padding=0)
                 self.log(f"Concatenation successful, final duration: {final_clip.duration}s")
+                self.update_progress("Concatenation complete", len(image_items) * 2 + 2)
             except Exception as e:
                 self.log(f"ERROR during concatenation: {str(e)}")
                 self.log(traceback.format_exc())
@@ -106,26 +166,86 @@ class VideoGenerator:
                 if len(set(sizes)) > 1:
                     self.log(f"ERROR: Clips have different sizes: {sizes}")
                 
+                self.update_progress(f"Failed: Error concatenating clips: {str(e)}", self.total_steps)
                 raise Exception(f"Error concatenating clips: {str(e)}")
             
             # Write the final video file
+            self.update_progress("Writing final video", len(image_items) * 2 + 3)
             try:
                 self.log(f"Writing video to {output_path}")
-                final_clip.write_videofile(
-                    output_path,
-                    fps=frame_rate,
-                    codec='libx264',
-                    bitrate=f"{bitrate}k",
-                    audio=False,
-                    threads=4,
-                    preset='medium',
-                    logger=None  # Disable moviepy's logger
-                )
-                self.log("Video successfully written")
+                
+                # Estimate writing time based on video duration and quality
+                estimated_time = final_clip.duration * 0.5  # Rough estimate: 0.5 seconds per second of video
+                if quality == "High" or quality == "Very High":
+                    estimated_time *= 1.5  # Higher quality takes longer
+                
+                # Set up a timer to update progress
+                writing_start_time = time.time()
+                stop_progress_thread = False
+                
+                def update_writing_progress():
+                    while not stop_progress_thread:
+                        elapsed_time = time.time() - writing_start_time
+                        progress = min(0.95, elapsed_time / estimated_time)  # Cap at 95%
+                        
+                        # Calculate progress step (last 7 steps)
+                        progress_step = len(image_items) * 2 + 3 + int(progress * 7)
+                        self.update_progress(f"Writing video: {int(progress*100)}%", progress_step)
+                        
+                        time.sleep(0.5)  # Update every half second
+                
+                # Start progress thread
+                progress_thread = threading.Thread(target=update_writing_progress)
+                progress_thread.daemon = True
+                progress_thread.start()
+                
+                # Write the video file
+                try:
+                    final_clip.write_videofile(
+                        output_path,
+                        fps=frame_rate,
+                        codec='libx264',
+                        bitrate=f"{bitrate}k",
+                        audio=False,
+                        threads=4,
+                        preset='medium',
+                        logger=None  # Disable moviepy's logger
+                    )
+                    
+                    # Stop the progress thread
+                    stop_progress_thread = True
+                    if progress_thread.is_alive():
+                        progress_thread.join(1.0)  # Wait for thread to finish
+                    
+                    self.log("Video successfully written")
+                    self.update_progress("Video generation complete", self.total_steps)
+                    self.log(f"Video generation complete: {output_path}")
+                except Exception as e:
+                    # Stop the progress thread
+                    stop_progress_thread = True
+                    if progress_thread.is_alive():
+                        progress_thread.join(1.0)  # Wait for thread to finish
+                    
+                    raise e
+                
+                # Verify the file exists and has a non-zero size
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    return True
+                else:
+                    self.log(f"ERROR: Output file does not exist or has zero size: {output_path}")
+                    return False
+                
             except Exception as e:
                 self.log(f"ERROR writing video: {str(e)}")
                 self.log(traceback.format_exc())
-                raise Exception(f"Error writing video: {str(e)}")
+                self.update_progress(f"Failed: Error writing video: {str(e)}", self.total_steps)
+                
+                # Check if the file was created despite the error
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    self.log(f"Video file exists and has content despite error: {output_path}")
+                    return True
+                else:
+                    raise Exception(f"Error writing video: {str(e)}")
             
             # Close clips to free memory
             self.log("Cleaning up clips")
@@ -143,7 +263,14 @@ class VideoGenerator:
                     clip.close()
                 except:
                     pass
-            raise Exception(f"Error generating video: {str(e)}")
+            self.update_progress(f"Failed: Error generating video: {str(e)}", self.total_steps)
+            
+            # Check if the file was created despite the error
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                self.log(f"Video file exists and has content despite error: {output_path}")
+                return True
+            else:
+                return False
     
     def _create_image_clip(self, image_item, width, height):
         """Create a video clip from an image with transitions and effects"""
@@ -173,6 +300,7 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR processing image with PIL: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error processing image with PIL: {str(e)}", self.total_steps)
                 raise Exception(f"Error processing image with PIL: {str(e)}")
             
             # Load the image with MoviePy
@@ -182,6 +310,7 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR loading image with MoviePy: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error loading image with MoviePy: {str(e)}", self.total_steps)
                 raise Exception(f"Error loading image with MoviePy: {str(e)}")
             
             # Resize to fit the aspect ratio while maintaining original aspect ratio
@@ -192,6 +321,7 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR resizing clip: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error resizing clip: {str(e)}", self.total_steps)
                 raise Exception(f"Error resizing clip: {str(e)}")
             
             # Set the duration
@@ -208,13 +338,16 @@ class VideoGenerator:
                     self.log(traceback.format_exc())
                     # Continue without the effect
                     self.log("  - Continuing without effect")
+                    self.update_progress(f"Failed: Error applying effect: {str(e)}", self.total_steps)
             
             # Apply overlay effect if specified
             if hasattr(image_item, 'overlay_effect') and image_item.overlay_effect != "None":
                 try:
                     self.log(f"  - Applying overlay effect: {image_item.overlay_effect}")
                     # Check if overlay_text attribute exists, use empty string if not
-                    overlay_text = getattr(image_item, 'overlay_text', '')
+                    overlay_text = ""
+                    if hasattr(image_item, 'overlay_text'):
+                        overlay_text = image_item.overlay_text
                     self.log(f"  - Overlay text: {overlay_text}")
                     img_clip = self._apply_overlay_effect(img_clip, image_item.overlay_effect, overlay_text)
                 except Exception as e:
@@ -222,6 +355,7 @@ class VideoGenerator:
                     self.log(traceback.format_exc())
                     # Continue without the overlay
                     self.log("  - Continuing without overlay effect")
+                    self.update_progress(f"Failed: Error applying overlay effect: {str(e)}", self.total_steps)
             
             # Apply start transition if specified
             if image_item.start_transition != "None":
@@ -237,6 +371,7 @@ class VideoGenerator:
                     self.log(traceback.format_exc())
                     # Continue without the transition
                     self.log("  - Continuing without start transition")
+                    self.update_progress(f"Failed: Error applying start transition: {str(e)}", self.total_steps)
             
             # Apply end transition if specified
             if image_item.end_transition != "None":
@@ -252,6 +387,7 @@ class VideoGenerator:
                     self.log(traceback.format_exc())
                     # Continue without the transition
                     self.log("  - Continuing without end transition")
+                    self.update_progress(f"Failed: Error applying end transition: {str(e)}", self.total_steps)
             
             # Clean up temporary file
             if temp_path and os.path.exists(temp_path):
@@ -262,6 +398,7 @@ class VideoGenerator:
                     self.log(f"  - WARNING: Could not remove temporary file: {str(e)}")
             
             self.log("  - Image clip creation completed successfully")
+            self.update_progress(f"Completed processing image {image_item.filepath}")
             return img_clip
             
         except Exception as e:
@@ -275,6 +412,7 @@ class VideoGenerator:
                 except:
                     pass
                     
+            self.update_progress(f"Failed: Error processing image: {str(e)}", self.total_steps)
             raise Exception(f"Error processing image: {str(e)}")
     
     def _resize_clip(self, clip, width, height):
@@ -305,6 +443,7 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR during resize operation: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error during resize operation: {str(e)}", self.total_steps)
                 raise Exception(f"Error during resize operation: {str(e)}")
             
             # Create a background clip with the target dimensions
@@ -315,6 +454,7 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR creating background clip: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error creating background clip: {str(e)}", self.total_steps)
                 raise Exception(f"Error creating background clip: {str(e)}")
             
             # Position the resized clip in the center of the background
@@ -334,11 +474,13 @@ class VideoGenerator:
             except Exception as e:
                 self.log(f"  - ERROR creating composite clip: {str(e)}")
                 self.log(traceback.format_exc())
+                self.update_progress(f"Failed: Error creating composite clip: {str(e)}", self.total_steps)
                 raise Exception(f"Error creating composite clip: {str(e)}")
                 
         except Exception as e:
             self.log(f"ERROR in _resize_clip: {str(e)}")
             self.log(traceback.format_exc())
+            self.update_progress(f"Failed: Error resizing clip: {str(e)}", self.total_steps)
             raise Exception(f"Error resizing clip: {str(e)}")
     
     def _apply_start_transition(self, clip, transition_type, duration):
@@ -639,14 +781,334 @@ class VideoGenerator:
             supported_overlays = [
                 "Watermark", "Text Caption", "Border", "Frame", 
                 "Vintage", "Dust and Scratches", "Film Grain", 
-                "Sepia Tone", "Black and White", "Film Noir"
+                "Sepia Tone", "Black and White", "Film Noir",
+                "Animated Particles", "Dynamic Text", "Animated Gradient", "Animated Frame"
             ]
             
             if overlay_type not in supported_overlays:
                 self.log(f"Unsupported overlay type: {overlay_type}, returning original clip")
                 return clip
                 
-            if overlay_type == "Watermark":
+            # Motion Graphics Effects
+            if overlay_type == "Animated Particles":
+                try:
+                    self.log("Applying animated particles overlay effect")
+                    
+                    # Create a set of particles with random positions, sizes, and speeds
+                    num_particles = 150  # Increased from 50 to 150
+                    particles = []
+                    for _ in range(num_particles):
+                        particles.append({
+                            'x': random.randint(0, clip_width),
+                            'y': random.randint(0, clip_height),
+                            'size': random.randint(3, 10),  # Increased size range
+                            'speed_x': random.uniform(-3, 3),  # Increased speed
+                            'speed_y': random.uniform(-3, 3),  # Increased speed
+                            'opacity': random.randint(150, 230),  # Increased opacity
+                            'color': (
+                                random.randint(200, 255),
+                                random.randint(200, 255),
+                                random.randint(200, 255)
+                            )
+                        })
+                    
+                    def add_animated_particles(get_frame, t):
+                        # Get the current frame
+                        frame = get_frame(t)
+                        
+                        # Create a PIL image from the frame
+                        img = Image.fromarray(frame)
+                        
+                        # Create a transparent overlay for particles
+                        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(overlay)
+                        
+                        # Draw each particle at its current position
+                        for particle in particles:
+                            # Calculate position based on time
+                            x = (particle['x'] + particle['speed_x'] * t * 60) % clip_width
+                            y = (particle['y'] + particle['speed_y'] * t * 60) % clip_height
+                            
+                            # Draw the particle
+                            draw.ellipse(
+                                [(x, y), (x + particle['size'], y + particle['size'])],
+                                fill=particle['color'] + (particle['opacity'],)
+                            )
+                        
+                        # Convert image to RGBA if needed
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
+                        
+                        # Composite the overlay onto the image
+                        result = Image.alpha_composite(img, overlay)
+                        
+                        # Convert back to RGB for MoviePy
+                        return np.array(result.convert('RGB'))
+                    
+                    # Apply the effect to each frame
+                    return clip.fl(add_animated_particles)
+                except Exception as e:
+                    self.log(f"Error applying animated particles effect: {str(e)}")
+                    self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying animated particles effect: {str(e)}", self.total_steps)
+                    return clip
+                
+            elif overlay_type == "Dynamic Text":
+                try:
+                    self.log("Applying dynamic text overlay effect")
+                    text = overlay_text or "Dynamic Text"
+                    self.log(f"Dynamic text: {text}")
+                    
+                    def add_dynamic_text(get_frame, t):
+                        # Get the current frame
+                        frame = get_frame(t)
+                        
+                        # Create a PIL image from the frame
+                        img = Image.fromarray(frame)
+                        
+                        # Create a transparent overlay for text
+                        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(overlay)
+                        
+                        # Try to load a font, fall back to default if not available
+                        try:
+                            font_path = "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"
+                            if not os.path.exists(font_path):
+                                font_path = "/home/ranjith/.conda/envs/business_apps/fonts/DejaVuSans-Bold.ttf"
+                                if not os.path.exists(font_path):
+                                    self.log(f"Warning: Could not find font at {font_path}, using default")
+                                    font = None
+                                else:
+                                    self.log(f"Using font from conda env: {font_path}")
+                                    font = ImageFont.truetype(font_path, 48)  # Increased font size from 36 to 48
+                            else:
+                                self.log(f"Using system font: {font_path}")
+                                font = ImageFont.truetype(font_path, 48)  # Increased font size from 36 to 48
+                        except Exception as e:
+                            self.log(f"Error loading font: {str(e)}")
+                            font = None
+                        
+                        # Calculate animation parameters
+                        clip_duration = clip.duration
+                        fade_duration = 0.5  # seconds for fade in/out
+                        
+                        # Calculate opacity based on time
+                        opacity = 255
+                        if t < fade_duration:
+                            # Fade in
+                            opacity = int(255 * (t / fade_duration))
+                        elif t > clip_duration - fade_duration:
+                            # Fade out
+                            opacity = int(255 * ((clip_duration - t) / fade_duration))
+                        
+                        # Calculate position with a more pronounced bounce effect
+                        bounce_height = 20  # Increased from 10 to 20
+                        bounce_speed = 3    # Increased from 2 to 3
+                        y_offset = int(math.sin(t * bounce_speed) * bounce_height)
+                        
+                        # Position text at the bottom center with bounce
+                        text_y = img.height - 150 + y_offset  # Moved up from 100 to 150
+                        
+                        # Draw semi-transparent background
+                        if font:
+                            try:
+                                # Get text size
+                                text_bbox = draw.textbbox((0, 0), text, font=font)
+                                text_width = text_bbox[2] - text_bbox[0] + 60  # Increased padding from 40 to 60
+                                text_height = text_bbox[3] - text_bbox[1] + 30  # Increased padding from 20 to 30
+                                
+                                # Center the text
+                                text_x = (img.width - text_width) // 2
+                                
+                                # Draw background with higher opacity
+                                draw.rectangle(
+                                    [(text_x, text_y), (text_x + text_width, text_y + text_height)],
+                                    fill=(0, 0, 0, min(200, opacity))  # Increased opacity from 160 to 200
+                                )
+                                
+                                # Draw text with current opacity
+                                draw.text(
+                                    (text_x + 30, text_y + 15),  # Adjusted position
+                                    text,
+                                    font=font,
+                                    fill=(255, 255, 255, opacity)
+                                )
+                            except Exception as e:
+                                self.log(f"Error rendering text: {str(e)}")
+                        
+                        # Convert image to RGBA if needed
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
+                        
+                        # Composite the overlay onto the image
+                        result = Image.alpha_composite(img, overlay)
+                        
+                        # Convert back to RGB for MoviePy
+                        return np.array(result.convert('RGB'))
+                    
+                    # Apply the effect to each frame
+                    return clip.fl(add_dynamic_text)
+                except Exception as e:
+                    self.log(f"Error applying dynamic text effect: {str(e)}")
+                    self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying dynamic text effect: {str(e)}", self.total_steps)
+                    return clip
+                
+            elif overlay_type == "Animated Gradient":
+                try:
+                    self.log("Applying animated gradient overlay effect")
+                    
+                    def add_animated_gradient(get_frame, t):
+                        # Get the current frame
+                        frame = get_frame(t)
+                        
+                        # Create a PIL image from the frame
+                        img = Image.fromarray(frame)
+                        width, height = img.size
+                        
+                        # Create a gradient overlay
+                        gradient = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(gradient)
+                        
+                        # Create a shifting color gradient based on time with more vibrant colors
+                        color1 = (
+                            int(127 + 127 * math.sin(t * 0.7)),  # Increased speed from 0.5 to 0.7
+                            int(127 + 127 * math.sin(t * 0.7 + 2)),
+                            int(127 + 127 * math.sin(t * 0.7 + 4))
+                        )
+                        color2 = (
+                            int(127 + 127 * math.sin(t * 0.7 + math.pi)),
+                            int(127 + 127 * math.sin(t * 0.7 + math.pi + 2)),
+                            int(127 + 127 * math.sin(t * 0.7 + math.pi + 4))
+                        )
+                        
+                        # Draw gradient from top-left to bottom-right with larger steps for better performance
+                        for y in range(0, height, 2):
+                            for x in range(0, width, 2):
+                                # Calculate gradient position (0 to 1)
+                                pos = (x / width + y / height) / 2
+                                
+                                # Calculate color at this position
+                                r = int(color1[0] * (1 - pos) + color2[0] * pos)
+                                g = int(color1[1] * (1 - pos) + color2[1] * pos)
+                                b = int(color1[2] * (1 - pos) + color2[2] * pos)
+                                
+                                # Draw a 2x2 rectangle for performance with higher opacity
+                                draw.rectangle(
+                                    [(x, y), (x + 1, y + 1)],
+                                    fill=(r, g, b, 60)  # Increased opacity from 30 to 60
+                                )
+                        
+                        # Convert image to RGBA if needed
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
+                        
+                        # Composite the gradient onto the image
+                        result = Image.alpha_composite(img, gradient)
+                        
+                        # Convert back to RGB for MoviePy
+                        return np.array(result.convert('RGB'))
+                    
+                    # Apply the effect to each frame
+                    return clip.fl(add_animated_gradient)
+                except Exception as e:
+                    self.log(f"Error applying animated gradient effect: {str(e)}")
+                    self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying animated gradient effect: {str(e)}", self.total_steps)
+                    return clip
+                
+            elif overlay_type == "Animated Frame":
+                try:
+                    self.log("Applying animated frame overlay effect")
+                    
+                    def add_animated_frame(get_frame, t):
+                        # Get the current frame
+                        frame = get_frame(t)
+                        
+                        # Create a PIL image from the frame
+                        img = Image.fromarray(frame)
+                        width, height = img.size
+                        
+                        # Create a transparent overlay for the frame
+                        overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                        draw = ImageDraw.Draw(overlay)
+                        
+                        # Calculate frame width based on time (pulsing effect) - increased base width
+                        base_frame_width = 40  # Increased from 20 to 40
+                        pulse_amount = 10      # Increased from 5 to 10
+                        frame_width = base_frame_width + int(pulse_amount * math.sin(t * 3))
+                        
+                        # Calculate frame color based on time (shifting hue)
+                        hue_shift = (t * 30) % 360  # Shift hue over time
+                        
+                        # Convert HSV to RGB (simplified conversion for primary colors)
+                        if hue_shift < 60:
+                            # Red to Yellow
+                            r = 255
+                            g = int(255 * (hue_shift / 60))
+                            b = 0
+                        elif hue_shift < 120:
+                            # Yellow to Green
+                            r = int(255 * (1 - (hue_shift - 60) / 60))
+                            g = 255
+                            b = 0
+                        elif hue_shift < 180:
+                            # Green to Cyan
+                            r = 0
+                            g = 255
+                            b = int(255 * ((hue_shift - 120) / 60))
+                        elif hue_shift < 240:
+                            # Cyan to Blue
+                            r = 0
+                            g = int(255 * (1 - (hue_shift - 180) / 60))
+                            b = 255
+                        elif hue_shift < 300:
+                            # Blue to Magenta
+                            r = int(255 * ((hue_shift - 240) / 60))
+                            g = 0
+                            b = 255
+                        else:
+                            # Magenta to Red
+                            r = 255
+                            g = 0
+                            b = int(255 * (1 - (hue_shift - 300) / 60))
+                        
+                        # Draw the animated frame with higher opacity
+                        # Outer rectangle
+                        draw.rectangle(
+                            [(0, 0), (width - 1, height - 1)],
+                            outline=(r, g, b, 230),  # Increased opacity from 200 to 230
+                            width=frame_width
+                        )
+                        
+                        # Inner rectangle (inset by frame width)
+                        draw.rectangle(
+                            [(frame_width, frame_width), 
+                             (width - 1 - frame_width, height - 1 - frame_width)],
+                            outline=(r, g, b, 150),  # Increased opacity from 100 to 150
+                            width=4  # Increased width from 2 to 4
+                        )
+                        
+                        # Convert image to RGBA if needed
+                        if img.mode != 'RGBA':
+                            img = img.convert('RGBA')
+                        
+                        # Composite the overlay onto the image
+                        result = Image.alpha_composite(img, overlay)
+                        
+                        # Convert back to RGB for MoviePy
+                        return np.array(result.convert('RGB'))
+                    
+                    # Apply the effect to each frame
+                    return clip.fl(add_animated_frame)
+                except Exception as e:
+                    self.log(f"Error applying animated frame effect: {str(e)}")
+                    self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying animated frame effect: {str(e)}", self.total_steps)
+                    return clip
+                
+            # Continue with existing overlay effects
+            elif overlay_type == "Watermark":
                 try:
                     self.log("Applying watermark overlay")
                     # Create a semi-transparent rectangle in the bottom right corner
@@ -694,7 +1156,7 @@ class VideoGenerator:
                             self.log(f"Drawing watermark rectangle at ({rect_x}, {rect_y}) with size {text_width}x{text_height}")
                             
                             # Create a semi-transparent overlay
-                            overlay = Image.new('RGBA', img.size, (0, 0, 0, 0))
+                            overlay = Image.new('RGBA', img.size, (0, 0, 0, 128))
                             overlay_draw = ImageDraw.Draw(overlay)
                             overlay_draw.rectangle(
                                 [(rect_x, rect_y), (rect_x + text_width, rect_y + text_height)],
@@ -727,6 +1189,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying watermark: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying watermark: {str(e)}", self.total_steps)
                     return clip
                 
             elif overlay_type == "Text Caption":
@@ -803,6 +1266,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying text caption: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying text caption: {str(e)}", self.total_steps)
                     return clip
                 
             elif overlay_type == "Border":
@@ -832,6 +1296,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying border: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying border: {str(e)}", self.total_steps)
                     return clip
                 
             elif overlay_type == "Frame":
@@ -843,7 +1308,8 @@ class VideoGenerator:
                             img = Image.fromarray(image)
                             
                             # Create a new image with a decorative frame
-                            frame_width = 30
+                            # Increased frame width from 30 to a percentage of the image size
+                            frame_width = max(60, int(min(img.width, img.height) * 0.05))  # At least 60px or 5% of image size
                             self.log(f"Adding frame with width: {frame_width}")
                             
                             # Create a new image with a black background
@@ -869,6 +1335,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying frame: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying frame: {str(e)}", self.total_steps)
                     return clip
                 
             elif overlay_type == "Vintage":
@@ -913,7 +1380,7 @@ class VideoGenerator:
                                     fill=alpha
                                 )
                             
-                            # Apply the vignette
+                            # Apply the mask
                             img = img.filter(ImageFilter.SMOOTH)
                             
                             # Create a black background
@@ -939,6 +1406,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying vintage effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying vintage effect: {str(e)}", self.total_steps)
                     return clip
             
             elif overlay_type == "Dust and Scratches":
@@ -1011,6 +1479,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying dust and scratches effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying dust and scratches effect: {str(e)}", self.total_steps)
                     return clip
             
             elif overlay_type == "Film Grain":
@@ -1048,6 +1517,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying film grain effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying film grain effect: {str(e)}", self.total_steps)
                     return clip
             
             elif overlay_type == "Sepia Tone":
@@ -1081,6 +1551,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying sepia tone effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying sepia tone effect: {str(e)}", self.total_steps)
                     return clip
             
             elif overlay_type == "Black and White":
@@ -1108,6 +1579,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying black and white effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying black and white effect: {str(e)}", self.total_steps)
                     return clip
             
             elif overlay_type == "Film Noir":
@@ -1166,6 +1638,7 @@ class VideoGenerator:
                 except Exception as e:
                     self.log(f"Error applying film noir effect: {str(e)}")
                     self.log(traceback.format_exc())
+                    self.update_progress(f"Failed: Error applying film noir effect: {str(e)}", self.total_steps)
                     return clip
             
             else:
@@ -1175,5 +1648,5 @@ class VideoGenerator:
         except Exception as e:
             self.log(f"ERROR in _apply_overlay_effect: {str(e)}")
             self.log(traceback.format_exc())
-            print(f"Warning: Error applying overlay effect: {str(e)}")
+            self.update_progress(f"Failed: Error applying overlay effect: {str(e)}", self.total_steps)
             return clip 
